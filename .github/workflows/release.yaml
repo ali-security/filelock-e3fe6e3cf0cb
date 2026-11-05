@@ -1,9 +1,6 @@
 name: 🚀 Release
 on:
-  push:
-    branches: ["main"]
-    tags: ["[0-9]+.[0-9]+.[0-9]+"]
-  pull_request:
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -11,10 +8,13 @@ permissions:
   contents: read
 env:
   dists-artifact-name: python-package-distributions
+  # Resolve the build backend's dependency closure as it existed at the 4.2.0 release.
+  UV_DEFAULT_INDEX: "https://:2026-10-14T20:57:11.349669Z@time-machines-pypi.sealsecurity.io/"
 jobs:
   build:
     name: 📦 build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -28,7 +28,12 @@ jobs:
         with:
           python-version: "3.15"
           enable-cache: false # this workflow builds the artifact that gets published; no cache to poison
+      - name: 📌 Pin the build backend that produced the published wheel
+        run: echo "hatchling==1.32.4" > "${RUNNER_TEMP}/build-constraints.txt"
       - name: 📦 Build package
+        env:
+          UV_BUILD_CONSTRAINT: ${{ runner.temp }}/build-constraints.txt
+          SETUPTOOLS_SCM_PRETEND_VERSION: "4.2.0"
         run: uv build --python 3.15 --python-preference only-managed --sdist --wheel . --out-dir dist
       - name: 📤 Store the distribution packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -38,8 +43,9 @@ jobs:
   publish:
     name: 🚀 publish
     needs: [build]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: false
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     environment:
       name: release
       url: https://pypi.org/project/filelock/${{ github.ref_name }}

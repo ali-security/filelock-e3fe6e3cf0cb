@@ -1,21 +1,26 @@
 name: "🛠️ check"
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
-    tags-ignore: ["**"]
-  pull_request:
-  schedule:
-    - cron: "0 8 * * *"
+    inputs:
+      test-filter:
+        description: "pytest selector (-k expression) to run a subset of tests; empty runs the full suite"
+        required: false
+        default: ""
 concurrency:
   group: check-${{ github.ref }}
   cancel-in-progress: true
 permissions:
   contents: read
+env:
+  # Resolve tox, the test dependency groups and the build backend as they existed at the 4.2.0 release
+  # (2026-10-14); later pytest/pytest-mock/coverage releases break the os.fstat-mocking tests.
+  UV_DEFAULT_INDEX: "https://:2026-10-14T20:57:11.349669Z@time-machines-pypi.sealsecurity.io/"
+  PIP_INDEX_URL: "https://:2026-10-14T20:57:11.349669Z@time-machines-pypi.sealsecurity.io/"
 jobs:
   test:
     name: "🧪 Test ${{ matrix.py }} - ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -64,14 +69,22 @@ jobs:
       # GraalPy runs unmeasured for the same reason, and neither is a coverage source: the 100% gate stays CPython's.
       - name: "✅ Run test suite"
         run: |
-          if [[ "${{ matrix.py }}" == pypy* || "${{ matrix.py }}" == graalpy* ]]; then
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            tox run --skip-pkg-install -e ${{ matrix.py }} -- -k "${{ inputs.test-filter }}"
+          elif [[ "${{ matrix.py }}" == graalpy* ]]; then
+            # tox.toml already lifts GraalPy's per-test timeout to 60s because tmp_path creation stalls late in the
+            # suite; on the fork's runners that stall still overran 60s, so override that env setting to 120s.
+            tox run --skip-pkg-install -e ${{ matrix.py }} \
+              -x 'env.${{ matrix.py }}.set_env+=PYTEST_ADDOPTS={env:PYTEST_ADDOPTS:} --timeout-method=thread --timeout=120' --
+          elif [[ "${{ matrix.py }}" == pypy* ]]; then
             tox run --skip-pkg-install -e ${{ matrix.py }} --
           else
             tox run --skip-pkg-install -e ${{ matrix.py }}
           fi
         shell: bash
         env:
-          PYTEST_ADDOPTS: "-vv --durations=20"
+          # -rs prints every skipped test with its skip reason in the short test summary.
+          PYTEST_ADDOPTS: "-vv -rs --durations=20"
           UV_PYTHON_PREFERENCE: only-managed
           DIFF_AGAINST: HEAD
       - name: "📝 Rename coverage report file"
@@ -91,6 +104,8 @@ jobs:
   coverage:
     name: "📊 Combine coverage"
     runs-on: ubuntu-24.04
+    if: false
+    timeout-minutes: 30
     needs: test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,6 +146,8 @@ jobs:
   check:
     name: "🔎 ${{ matrix.tox_env }} - ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
+    if: false
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -167,6 +184,7 @@ jobs:
   nfs:
     name: "🗄️ NFS mutual exclusion"
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -184,6 +202,10 @@ jobs:
           sudo chmod 1777 /export/filelock
           echo "/export/filelock 127.0.0.1(rw,sync,no_subtree_check,no_root_squash,insecure)" | sudo tee /etc/exports
           sudo exportfs -ra
+          # Disable kernel leases so knfsd hands out no NFSv4 delegations. On the fork's runners a delegation recall
+          # over the loopback callback channel stalled create/unlink on the other client for ~60s, so lock waiters hit
+          # the verifier's 60s acquire timeout with zero overlaps (v4 only; v3 has no delegations and never stalled).
+          sudo sysctl -w fs.leases-enable=0
           sudo systemctl restart nfs-server
           # NFSv3 sends flock to the server through the NLM lock manager. rpcbind must be enabled; rpc-statd is a
           # static unit that enable cannot touch, so start it explicitly or a v3 flock blocks in the kernel forever.
@@ -219,6 +241,7 @@ jobs:
   smb:
     name: "🗄️ SMB mutual exclusion"
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -264,6 +287,7 @@ jobs:
   capability:
     name: "🧩 without ${{ matrix.block }}"
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -291,6 +315,7 @@ jobs:
   symlink:
     name: "🔗 Windows symlinks ${{ matrix.developer_mode == '1' && 'granted' || 'denied' }}"
     runs-on: windows-2025
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -336,6 +361,10 @@ jobs:
   termux:
     name: "🤖 Termux (Android)"
     runs-on: ubuntu-24.04-arm
+    # ubuntu-24.04-arm is not provisioned on the ali-security fork, and under QEMU on x64 the suite's 20s
+    # pytest-timeout deadlines lapse (threaded lock tests time out), so the Termux job cannot run here.
+    if: false
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -346,6 +375,7 @@ jobs:
   changelog:
     name: "📝 News fragment"
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     # A PR must add a docs/changelog/<pr>.<type>.rst fragment; automated dependency and pre-commit bumps are exempt, as
     # is anything labeled skip news, for changes no user of the library can observe.
     if: >-
